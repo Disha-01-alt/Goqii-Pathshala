@@ -1,0 +1,5 @@
+services
+supabase
+tts-samples
+graphify-out
+*.md
