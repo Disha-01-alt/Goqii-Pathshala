@@ -16,13 +16,16 @@ Tiny footprint — no model to load — so it runs on any free CPU host.
 import asyncio
 import base64
 import glob
+import json
 import os
+import re
 import subprocess
 import tempfile
+import urllib.error
 import urllib.request
 
 import edge_tts
-from fastapi import FastAPI, Header, HTTPException, Response
+from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Response
 from pydantic import BaseModel, Field
 
 SHARED_SECRET = os.environ.get("TTS_SHARED_SECRET", "")
@@ -292,3 +295,230 @@ def stitch_video(req: StitchRequest, x_api_key: str = Header(default="")):
         media_type="video/mp4",
         headers={"x-engine": "ffmpeg"},
     )
+
+
+# ─── Full async pipeline (free + reliable) ────────────────────────────────
+# The Supabase edge function only kicks this off and returns immediately, so it
+# can't be killed mid-render by the function wall-clock limit. This endpoint does
+# the whole job — render → narrate (Gemini for note-less decks) → stitch — in a
+# background task and writes progress + the finished MP4 back to Supabase itself.
+
+class BuildModuleRequest(BaseModel):
+    moduleId: str
+    jobId: str
+    pptxUrl: str
+    supabaseUrl: str
+    supabaseServiceKey: str
+    speakerNotes: list[dict] = []
+    narrationLanguage: str = "en"
+    narrationVoiceDescription: str | None = None
+    geminiApiKey: str | None = None
+    deckTitle: str = "Lesson"
+    dpi: int = 150
+    bucket: str = "module-files"
+
+
+def _http(method: str, url: str, headers: dict, data: bytes | None = None, timeout: int = 120):
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, r.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read()
+
+
+def _looks_markup(s: str) -> bool:
+    return bool(re.search(r"</?(?:a|p|w|r|c):[a-z]", s or "", re.I))
+
+
+def _sanitize(s: str) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", s or "")).strip()
+
+
+def _sb_upload(sb: str, key: str, bucket: str, path: str, data: bytes, ctype: str) -> str:
+    status, body = _http(
+        "POST", f"{sb}/storage/v1/object/{bucket}/{path}",
+        {"apikey": key, "Authorization": f"Bearer {key}", "Content-Type": ctype, "x-upsert": "true"},
+        data, timeout=120,
+    )
+    if status not in (200, 201):
+        raise RuntimeError(f"upload {path} failed [{status}]: {body[:150]}")
+    return f"{sb}/storage/v1/object/public/{bucket}/{path}"
+
+
+def _sb_job_update(sb: str, key: str, job_id: str, fields: dict) -> None:
+    _http(
+        "PATCH", f"{sb}/rest/v1/video_generation_jobs?id=eq.{job_id}",
+        {"apikey": key, "Authorization": f"Bearer {key}", "Content-Type": "application/json", "Prefer": "return=minimal"},
+        json.dumps(fields).encode(), timeout=30,
+    )
+
+
+def _sb_upsert(sb: str, key: str, table: str, on_conflict: str, row: dict) -> None:
+    _http(
+        "POST", f"{sb}/rest/v1/{table}?on_conflict={on_conflict}",
+        {"apikey": key, "Authorization": f"Bearer {key}", "Content-Type": "application/json",
+         "Prefer": "resolution=merge-duplicates,return=minimal"},
+        json.dumps(row).encode(), timeout=30,
+    )
+
+
+def _gemini_narrate(api_key: str, deck_title: str, slide_texts: list[str]) -> list[str]:
+    lst = "\n\n".join(
+        f"[{i + 1}] {t.strip() if t and t.strip() else '(no text on this slide)'}"
+        for i, t in enumerate(slide_texts)
+    )
+    system = (
+        "You are an expert instructor writing voice-over narration for an educational "
+        "slide video. For each slide, write natural SPOKEN narration that explains and "
+        "teaches the idea to a learner — do NOT just read the on-screen text. 2 to 4 "
+        "sentences per slide. Plain prose only (a TTS engine will speak it): no markdown, "
+        "no bullet characters, no emojis, no raw code symbols; describe code in words. "
+        "Let each slide flow naturally from the previous one."
+    )
+    user = (
+        f"Deck title: {deck_title}\n\nText extracted from each slide:\n\n{lst}\n\n"
+        f"Write exactly {len(slide_texts)} narrations, one per slide, in order."
+    )
+    body = {
+        "system_instruction": {"parts": [{"text": system}]},
+        "contents": [{"parts": [{"text": user}]}],
+        "generationConfig": {
+            "temperature": 0.6,
+            "responseMimeType": "application/json",
+            "responseSchema": {"type": "ARRAY", "items": {"type": "STRING"}},
+        },
+    }
+    status, b = _http(
+        "POST",
+        f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}",
+        {"Content-Type": "application/json"}, json.dumps(body).encode(), timeout=120,
+    )
+    if status != 200:
+        raise RuntimeError(f"gemini [{status}]: {b[:200]}")
+    txt = json.loads(b).get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
+    arr = json.loads(txt)
+    return [_sanitize(str(x or "")) for x in arr] if isinstance(arr, list) else []
+
+
+def _build_module(req: BuildModuleRequest) -> None:
+    sb, key = req.supabaseUrl.rstrip("/"), req.supabaseServiceKey
+
+    def jobset(**fields):
+        try:
+            _sb_job_update(sb, key, req.jobId, fields)
+        except Exception as e:
+            print("job update failed:", e)
+
+    try:
+        jobset(status="processing", progress=5, current_step="Rendering slides...")
+        with tempfile.TemporaryDirectory() as d:
+            pptx = os.path.join(d, "deck.pptx")
+            _download(req.pptxUrl, pptx)
+            pdf = _pptx_to_pdf(pptx, d)
+            prefix = os.path.join(d, "slide")
+            p = subprocess.run(["pdftoppm", "-png", "-r", str(req.dpi), pdf, prefix],
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=180)
+            if p.returncode != 0:
+                raise RuntimeError((p.stderr.decode() or "pdftoppm failed")[:300])
+            pngs = sorted(glob.glob(prefix + "*.png"),
+                          key=lambda x: int("".join(filter(str.isdigit, os.path.basename(x))) or 0))
+            if not pngs:
+                raise RuntimeError("no slides rendered")
+
+            texts: list[str] = []
+            tpath = os.path.join(d, "deck.txt")
+            tp = subprocess.run(["pdftotext", "-layout", pdf, tpath],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
+            if tp.returncode == 0 and os.path.exists(tpath):
+                raw = open(tpath, encoding="utf-8", errors="ignore").read()
+                texts = [" ".join(pg.split()) for pg in raw.split("\f")]
+            n = len(pngs)
+            texts = (texts + [""] * n)[:n]
+
+            jobset(scene_total=n, progress=15, current_step="Uploading slides...")
+            image_urls: list[str] = []
+            for i, f in enumerate(pngs):
+                with open(f, "rb") as fh:
+                    image_urls.append(_sb_upload(sb, key, req.bucket,
+                                                 f"video-gen/{req.moduleId}/slide-{i + 1}.png",
+                                                 fh.read(), "image/png"))
+            _sb_upsert(sb, key, "module_outputs", "module_id,format_type",
+                       {"module_id": req.moduleId, "format_type": "slide_images",
+                        "content": {"images": image_urls, "texts": texts}, "status": "completed"})
+
+            # Narration text per slide: clean speaker note wins; else Gemini from
+            # slide text; else raw slide text.
+            notes_by: dict[int, str] = {}
+            for i, nt in enumerate(req.speakerNotes or []):
+                sidx = nt.get("slideNumber") or i + 1
+                if nt.get("text"):
+                    notes_by[sidx] = nt["text"]
+            narrations = [""] * n
+            need: list[int] = []
+            for i in range(n):
+                note = notes_by.get(i + 1, "")
+                if note and not _looks_markup(note):
+                    narrations[i] = _sanitize(note)
+                else:
+                    need.append(i)
+            if need:
+                gen: list[str] = []
+                if req.geminiApiKey:
+                    jobset(progress=25, current_step="Writing narration script...")
+                    try:
+                        gen = _gemini_narrate(req.geminiApiKey, req.deckTitle, [_sanitize(texts[i]) for i in need])
+                    except Exception as e:
+                        print("gemini failed:", e)
+                        gen = []
+                for k, idx in enumerate(need):
+                    narrations[idx] = (gen[k] if k < len(gen) and gen[k] else _sanitize(texts[idx])).strip()
+
+            jobset(progress=30, current_step="Generating narration...")
+            voice = pick_voice(VoiceRequest(text="x", language=req.narrationLanguage,
+                                            voice_description=req.narrationVoiceDescription))
+            rate = STYLE_RATE.get("narration", "-5%")
+            scenes: list[Scene] = []
+            for i in range(n):
+                nar = narrations[i]
+                jobset(progress=30 + int((i / max(n, 1)) * 50), scene_completed=i,
+                       current_step=f"Narrating slide {i + 1} of {n}...")
+                if not nar:
+                    scenes.append(Scene(imageUrl=image_urls[i], audioUrl=None, duration=5))
+                    continue
+                try:
+                    mp3 = asyncio.run(synth_mp3(nar[:4000], voice, rate))
+                    wav = mp3_to_wav(mp3)
+                except Exception as e:
+                    print(f"tts failed slide {i + 1}:", e)
+                    scenes.append(Scene(imageUrl=image_urls[i], audioUrl=None, duration=5))
+                    continue
+                au = _sb_upload(sb, key, req.bucket,
+                                f"video-gen/{req.moduleId}/slide-{i + 1}-audio.wav", wav, "audio/wav")
+                _sb_upsert(sb, key, "module_slide_audio", "module_id,slide_number",
+                           {"module_id": req.moduleId, "slide_number": i + 1, "narration_text": nar,
+                            "audio_url": au, "audio_duration": max(4, len(nar) // 15),
+                            "audio_status": "completed", "voice_id": "edge-tts"})
+                scenes.append(Scene(imageUrl=image_urls[i], audioUrl=au, duration=max(4, len(nar) // 15)))
+
+            jobset(progress=85, scene_completed=n, current_step="Stitching final video...")
+            mp4 = build_video(scenes, 1280, 720, 10)
+            vurl = _sb_upload(sb, key, req.bucket, f"video-gen/{req.moduleId}/output.mp4", mp4, "video/mp4")
+
+            jobset(status="completed", progress=100, current_step="Done", output_video_url=vurl)
+            _sb_upsert(sb, key, "module_outputs", "module_id,format_type",
+                       {"module_id": req.moduleId, "format_type": "video",
+                        "content": {"url": vurl}, "status": "completed", "video_url": vurl})
+    except Exception as e:
+        print("build_module failed:", e)
+        jobset(status="failed", error_message=str(e)[:480])
+
+
+@app.post("/build-module")
+def build_module(req: BuildModuleRequest, background_tasks: BackgroundTasks, x_api_key: str = Header(default="")):
+    if not SHARED_SECRET or x_api_key != SHARED_SECRET:
+        raise HTTPException(status_code=401, detail="Invalid or missing x-api-key")
+    if not req.moduleId or not req.jobId or not req.pptxUrl or not req.supabaseServiceKey:
+        raise HTTPException(status_code=400, detail="moduleId, jobId, pptxUrl, supabaseServiceKey required")
+    background_tasks.add_task(_build_module, req)
+    return {"status": "accepted", "jobId": req.jobId}
