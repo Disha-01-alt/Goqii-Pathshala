@@ -377,19 +377,8 @@ export default function ModuleViewer() {
             </div>
           )}
 
-          {/* Narrated-video render for any uploaded PPTX module (notes optional) */}
-          {moduleType === "ppt" && slides?.fileUrl && (
-            <div className="mb-6">
-              <VideoGenerationProgress
-                moduleId={module.id}
-                scenes={Array.isArray(slides?.speakerNotes) ? slides.speakerNotes : []}
-                endpoint="uploaded"
-                onVideoReady={(url) => setLiveVideoUrl(url)}
-              />
-            </div>
-          )}
-
-          {/* Module content */}
+          {/* Module content (uploaded PPTX renders as a narrated slideshow,
+              which handles its own build trigger + progress + playback) */}
           <ModuleRouter
             module={moduleData}
             moduleType={moduleType}

@@ -5,6 +5,7 @@ import UploadedDocumentDisplay from "./UploadedDocumentDisplay";
 import QuizModuleDisplay from "./QuizModuleDisplay";
 import QuizSection from "./QuizSection";
 import PresentationModuleDisplay from "./PresentationModuleDisplay";
+import NarratedSlideshow from "./NarratedSlideshow";
 import InteractivePPTPlayer from "./InteractivePPTPlayer";
 import ArticleModuleDisplay from "./ArticleModuleDisplay";
 import DocumentModuleDisplay from "./DocumentModuleDisplay";
@@ -221,29 +222,25 @@ export default function ModuleRouter({
       );
     }
     
-    // PPT/PPTX file
+    // PPT/PPTX file → narrated slideshow (rendered slides read aloud with AI
+    // narration). Falls back to the raw deck viewer only if we have no module id.
     if (fileType === "ppt" || fileUrl?.toLowerCase().match(/\.pptx?$/)) {
-      // Once the narrated MP4 has rendered, play it instead of the slide deck.
-      if (module?.resolvedVideoUrl) {
-        return (
-          <>
-            <VideoModuleDisplay
-              module={{ title: module.title, fileUrl: module.resolvedVideoUrl }}
-              savedModuleId={savedModuleId}
-              onModuleComplete={handleContentComplete}
-            />
-            {renderQuizSection()}
-          </>
-        );
-      }
       return (
         <>
-          <PresentationModuleDisplay
-            module={{ title: module.title, fileUrl, fileName }}
-            savedModuleId={savedModuleId}
-            timeLimitMinutes={timeLimitMinutes}
-            onModuleComplete={handleContentComplete}
-          />
+          {savedModuleId ? (
+            <NarratedSlideshow
+              moduleId={savedModuleId}
+              title={module.title}
+              onModuleComplete={handleContentComplete}
+            />
+          ) : (
+            <PresentationModuleDisplay
+              module={{ title: module.title, fileUrl, fileName }}
+              savedModuleId={savedModuleId}
+              timeLimitMinutes={timeLimitMinutes}
+              onModuleComplete={handleContentComplete}
+            />
+          )}
           {renderQuizSection()}
         </>
       );
