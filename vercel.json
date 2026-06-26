@@ -3,21 +3,9 @@
   "framework": "vite",
   "buildCommand": "vite build",
   "outputDirectory": "dist",
-  "rewrites": [
-    {
-      "source": "/(.*)",
-      "destination": "/index.html"
-    }
-  ],
-  "experimentalServices": {
-    "frontend": {
-      "routePrefix": "/",
-      "framework": "vite"
-    },
-    "edge-tts": {
-      "root": "services/edge-tts",
-      "entrypoint": "app:app",
-      "routePrefix": "/_/edge-tts"
-    }
-  }
+  "rewrites": [{ "source": "/(.*)", "destination": "/index.html" }],
+  "headers": [
+    { "source": "/", "headers": [{ "key": "Cache-Control", "value": "no-store, must-revalidate" }] },
+    { "source": "/index.html", "headers": [{ "key": "Cache-Control", "value": "no-store, must-revalidate" }] }
+  ]
 }
