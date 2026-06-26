@@ -1,0 +1,37 @@
+project_id = "hotgvaslifqvtcbedyup"
+
+[functions.test-ai-connection]
+verify_jwt = false
+
+[functions.generate-audio]
+verify_jwt = false
+
+[functions.generate-voice]
+verify_jwt = false
+
+[functions.generate-prompt]
+verify_jwt = false
+
+[functions.generate-content]
+verify_jwt = false
+
+[functions.format-content]
+verify_jwt = false
+
+[functions.generate-quiz]
+verify_jwt = false
+
+[functions.generate-assignments]
+verify_jwt = false
+
+[functions.generate-final-module]
+verify_jwt = false
+
+[functions.generate-video-pipeline]
+verify_jwt = false
+
+[functions.check-video-render]
+verify_jwt = false
+
+[functions.generate-slide-images]
+verify_jwt = false
