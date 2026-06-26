@@ -5,7 +5,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
 import {
-  Play, Pause, ChevronLeft, ChevronRight, Volume2, Loader2, Sparkles, CheckCircle,
+  Play, Pause, ChevronLeft, ChevronRight, Volume2, Loader2, Sparkles, CheckCircle, RotateCcw,
 } from "lucide-react";
 import { toast } from "sonner";
 
@@ -22,20 +22,18 @@ interface NarratedSlideshowProps {
 
 /**
  * Plays an uploaded deck as a narrated slideshow: rendered slide images shown
- * full-bleed with the AI narration audio for each slide, auto-advancing as each
- * clip ends. Uses the assets the pipeline stores (module_outputs.slide_images +
- * module_slide_audio) — no MP4 stitch required, so it's reliable on free infra.
+ * full-bleed with the AI narration audio for each slide, AUTO-ADVANCING as each
+ * clip ends. One Play press runs the whole deck. Uses assets the pipeline stores
+ * (module_outputs.slide_images + module_slide_audio) — no MP4 stitch required.
  */
 export default function NarratedSlideshow({ moduleId, title, onModuleComplete }: NarratedSlideshowProps) {
   const audioRef = useRef<HTMLAudioElement>(null);
   const [idx, setIdx] = useState(0);
   const [playing, setPlaying] = useState(false);
+  const [autoTried, setAutoTried] = useState(false);
   const [starting, setStarting] = useState(false);
   const [completed, setCompleted] = useState(false);
 
-  // Slide images + per-slide narration audio. Polls until they appear so the
-  // slideshow shows up as soon as render + narration finish (before/independent
-  // of any video stitch).
   const { data: slides = [] } = useQuery({
     queryKey: ["slideshow-assets", moduleId],
     queryFn: async (): Promise<Slide[]> => {
@@ -64,7 +62,6 @@ export default function NarratedSlideshow({ moduleId, title, onModuleComplete }:
 
   const ready = slides.length > 0;
 
-  // Build job (only used to show progress before the assets exist).
   const { data: job } = useQuery({
     queryKey: ["slideshow-job", moduleId],
     queryFn: async () => {
@@ -82,39 +79,51 @@ export default function NarratedSlideshow({ moduleId, title, onModuleComplete }:
 
   const cur = slides[idx];
 
-  // Drive playback: load the current slide's audio; auto-advance silent slides.
-  useEffect(() => {
-    const el = audioRef.current;
-    if (!el || !cur) return;
-    el.src = cur.audio || "";
-    if (playing && cur.audio) {
-      el.play().catch(() => setPlaying(false));
-    }
-    if (playing && !cur.audio) {
-      const t = setTimeout(() => advance(), 5000);
-      return () => clearTimeout(t);
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [idx, cur?.audio, playing]);
-
+  // Move to the next slide; keep `playing` true so the chain continues.
   const advance = () => {
     setIdx((i) => {
       if (i < slides.length - 1) return i + 1;
       setPlaying(false);
-      if (!completed) { setCompleted(true); onModuleComplete?.(); }
+      setCompleted((done) => {
+        if (!done) onModuleComplete?.();
+        return true;
+      });
       return i;
     });
   };
 
+  // Single source of truth for playback: whenever the slide or play-state
+  // changes, play the current slide's audio (or hold a silent slide ~6s).
+  // NOTE: we do NOT bind to the audio element's pause/ended events for state —
+  // browsers fire `pause` when a clip ends, which would otherwise stop the chain.
+  useEffect(() => {
+    const el = audioRef.current;
+    if (!el) return;
+    if (!playing || !cur) { el.pause(); return; }
+    if (cur.audio) {
+      if (el.src !== cur.audio) el.src = cur.audio;
+      el.play().catch(() => setPlaying(false)); // blocked autoplay → wait for a click
+      return;
+    }
+    const t = setTimeout(advance, 6000); // silent slide
+    return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [idx, playing, cur?.audio]);
+
+  // Try to start automatically once assets are ready (browsers may block audio
+  // autoplay until the user interacts — then the Play button starts it, and it
+  // runs through to the end on its own).
+  useEffect(() => {
+    if (ready && !autoTried) {
+      setAutoTried(true);
+      setPlaying(true);
+    }
+  }, [ready, autoTried]);
+
   const toggle = () => {
     if (!cur) return;
-    if (playing) {
-      setPlaying(false);
-      audioRef.current?.pause();
-    } else {
-      setPlaying(true);
-      if (cur.audio) audioRef.current?.play().catch(() => setPlaying(false));
-    }
+    if (completed) { setIdx(0); setCompleted(false); setPlaying(true); return; }
+    setPlaying((p) => !p);
   };
 
   const go = (n: number) => setIdx(Math.max(0, Math.min(slides.length - 1, n)));
@@ -139,22 +148,26 @@ export default function NarratedSlideshow({ moduleId, title, onModuleComplete }:
         {title && <h1 className="text-lg font-bold text-foreground mb-3">{title}</h1>}
         <Card className="overflow-hidden">
           <CardContent className="p-0">
-            <div className="bg-black flex items-center justify-center" style={{ aspectRatio: "16 / 9" }}>
+            <div className="relative bg-black flex items-center justify-center" style={{ aspectRatio: "16 / 9" }}>
               {cur?.image && (
                 <img src={cur.image} alt={`Slide ${idx + 1}`} className="max-h-full max-w-full object-contain" />
               )}
+              {!playing && !completed && (
+                <button
+                  onClick={toggle}
+                  className="absolute inset-0 flex items-center justify-center bg-black/30 hover:bg-black/40 transition-colors"
+                  aria-label="Play"
+                >
+                  <span className="flex h-16 w-16 items-center justify-center rounded-full bg-white/90 shadow-lg">
+                    <Play className="h-7 w-7 text-black ml-1" />
+                  </span>
+                </button>
+              )}
             </div>
-            <audio
-              ref={audioRef}
-              onEnded={advance}
-              onPlay={() => setPlaying(true)}
-              onPause={() => setPlaying(false)}
-              preload="auto"
-              className="hidden"
-            />
+            <audio ref={audioRef} onEnded={advance} preload="auto" className="hidden" />
             <div className="flex items-center gap-1 px-4 py-3 border-t">
               <Button size="icon" variant="ghost" className="h-9 w-9" onClick={toggle} aria-label={playing ? "Pause" : "Play"}>
-                {playing ? <Pause className="h-5 w-5" /> : <Play className="h-5 w-5" />}
+                {completed ? <RotateCcw className="h-5 w-5" /> : playing ? <Pause className="h-5 w-5" /> : <Play className="h-5 w-5" />}
               </Button>
               <Button size="icon" variant="ghost" className="h-9 w-9" onClick={() => go(idx - 1)} disabled={idx === 0}>
                 <ChevronLeft className="h-5 w-5" />
@@ -166,17 +179,17 @@ export default function NarratedSlideshow({ moduleId, title, onModuleComplete }:
                 <Volume2 className="h-3.5 w-3.5" />
                 <span>Slide {idx + 1} of {slides.length}{cur && !cur.audio ? " (no narration)" : ""}</span>
               </div>
+              {completed && (
+                <span className="ml-auto flex items-center gap-1 text-xs text-green-600">
+                  <CheckCircle className="h-3.5 w-3.5" /> Finished
+                </span>
+              )}
             </div>
             <div className="px-4 pb-3">
               <Progress value={((idx + 1) / slides.length) * 100} className="h-1.5" />
             </div>
           </CardContent>
         </Card>
-        {completed && (
-          <div className="mt-3 flex items-center gap-2 text-sm text-green-600">
-            <CheckCircle className="h-4 w-4" /> Finished
-          </div>
-        )}
       </div>
     );
   }
