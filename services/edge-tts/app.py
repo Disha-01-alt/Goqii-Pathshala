@@ -21,11 +21,12 @@ import os
 import re
 import subprocess
 import tempfile
+import threading
 import urllib.error
 import urllib.request
 
 import edge_tts
-from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Response
+from fastapi import FastAPI, Header, HTTPException, Response
 from pydantic import BaseModel, Field
 
 SHARED_SECRET = os.environ.get("TTS_SHARED_SECRET", "")
@@ -216,8 +217,8 @@ def _download(url: str, path: str) -> None:
         f.write(r.read())
 
 
-def _run_ffmpeg(cmd: list[str]) -> None:
-    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+def _run_ffmpeg(cmd: list[str], timeout: int = 600) -> None:
+    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
     if p.returncode != 0:
         raise RuntimeError(p.stderr.decode()[:400])
 
@@ -515,10 +516,14 @@ def _build_module(req: BuildModuleRequest) -> None:
 
 
 @app.post("/build-module")
-def build_module(req: BuildModuleRequest, background_tasks: BackgroundTasks, x_api_key: str = Header(default="")):
+def build_module(req: BuildModuleRequest, x_api_key: str = Header(default="")):
     if not SHARED_SECRET or x_api_key != SHARED_SECRET:
         raise HTTPException(status_code=401, detail="Invalid or missing x-api-key")
     if not req.moduleId or not req.jobId or not req.pptxUrl or not req.supabaseServiceKey:
         raise HTTPException(status_code=400, detail="moduleId, jobId, pptxUrl, supabaseServiceKey required")
-    background_tasks.add_task(_build_module, req)
+    # Detached daemon thread, NOT a FastAPI BackgroundTask: it must survive the
+    # HTTP request lifecycle. HF closes the connection right after this 202, which
+    # would kill a request-bound BackgroundTask mid-stitch. A thread keeps running
+    # in the container until the job finishes.
+    threading.Thread(target=_build_module, args=(req,), daemon=True).start()
     return {"status": "accepted", "jobId": req.jobId}
